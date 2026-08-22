@@ -1,0 +1,530 @@
+diff --git a/arch/arm64/Kconfig b/arch/arm64/Kconfig
+index 610194267..cbfe7d07f 100644
+--- a/arch/arm64/Kconfig
++++ b/arch/arm64/Kconfig
+@@ -49,6 +49,7 @@ config ARM64
+ 	select ARCH_HAS_FORCE_DMA_UNENCRYPTED
+ 	select ARCH_STACKWALK
+ 	select ARCH_HAS_STRICT_KERNEL_RWX
++	select ARCH_OPTIONAL_KERNEL_RWX
+ 	select ARCH_HAS_STRICT_MODULE_RWX
+ 	select ARCH_HAS_SYNC_DMA_FOR_DEVICE
+ 	select ARCH_HAS_SYNC_DMA_FOR_CPU
+diff --git a/arch/arm64/include/asm/kvm_rme.h b/arch/arm64/include/asm/kvm_rme.h
+index cd42c19ca..42a4eec28 100644
+--- a/arch/arm64/include/asm/kvm_rme.h
++++ b/arch/arm64/include/asm/kvm_rme.h
+@@ -8,6 +8,7 @@
+ 
+ #include <asm/rmi_smc.h>
+ #include <uapi/linux/kvm.h>
++#include <linux/wait.h>
+ 
+ /**
+  * enum realm_state - State of a Realm
+@@ -84,6 +85,15 @@ struct realm_rec {
+ 	void *rec_page;
+ 	struct page *aux_pages[REC_PARAMS_AUX_GRANULES];
+ 	struct rec_run *run;
++	bool vmi_scan_pending;
++	bool vmi_cmd_pending;
++	u8   vmi_cmd_type;
++	u64  vmi_cmd_arg0;
++	bool vmi_cmd_waiting;
++	bool vmi_cmd_done;
++	s32  vmi_result_status;
++	u64  vmi_result_val;
++	wait_queue_head_t vmi_wait;
+ };
+ 
+ void kvm_init_rme(void);
+@@ -102,6 +112,9 @@ int kvm_create_rec(struct kvm_vcpu *vcpu);
+ void kvm_destroy_rec(struct kvm_vcpu *vcpu);
+ 
+ int kvm_rec_enter(struct kvm_vcpu *vcpu);
++int kvm_vmi_scan_procs(struct kvm_vcpu *vcpu);
++
++int kvm_cca_vmi_dispatch(struct kvm_vcpu *vcpu, struct kvm_cca_vmi_cmd *cmd);
+ int handle_rec_exit(struct kvm_vcpu *vcpu, int rec_run_status);
+ 
+ void kvm_realm_unmap_range(struct kvm *kvm,
+diff --git a/arch/arm64/include/asm/rmi_cmds.h b/arch/arm64/include/asm/rmi_cmds.h
+index 3ed32809a..d87f82005 100644
+--- a/arch/arm64/include/asm/rmi_cmds.h
++++ b/arch/arm64/include/asm/rmi_cmds.h
+@@ -298,6 +298,31 @@ static inline int rmi_rec_enter(unsigned long rec, unsigned long run_ptr)
+ 	return res.a0;
+ }
+ 
++/**
++ * rmi_vmi_scan_procs() - Trigger VMI process scan
++ * @rec: PA of the target REC
++ * @run_ptr: PA of RecRun structure
++ *
++ * Triggers a VMI process list scan from the RMM.
++ *
++ * Return: RMI return code
++ */
++static inline int rmi_vmi_scan_procs_ex(unsigned long rec, unsigned long run_ptr,
++                                        unsigned long cmd, unsigned long arg0,
++                                        unsigned long *out_val)
++{
++        struct arm_smccc_res res;
++        arm_smccc_1_1_invoke(SMC_RMI_VMI_SCAN_PROCS, rec, run_ptr,
++                             cmd, arg0, &res);
++        if (out_val)
++                *out_val = res.a1;
++        return res.a0;
++}
++
++static inline int rmi_vmi_scan_procs(unsigned long rec, unsigned long run_ptr)
++{
++        return rmi_vmi_scan_procs_ex(rec, run_ptr, 0, 0, NULL);
++}
+ /**
+  * rmi_rtt_create() - Creates an RTT
+  * @rd: PA of the RD
+diff --git a/arch/arm64/include/asm/rmi_smc.h b/arch/arm64/include/asm/rmi_smc.h
+index 0fde2e06d..47a835177 100644
+--- a/arch/arm64/include/asm/rmi_smc.h
++++ b/arch/arm64/include/asm/rmi_smc.h
+@@ -39,6 +39,7 @@
+ #define SMC_RMI_RTT_MAP_UNPROTECTED	SMC_RxI_CALL(0x015f)
+ #define SMC_RMI_RTT_READ_ENTRY		SMC_RxI_CALL(0x0161)
+ #define SMC_RMI_RTT_SET_RIPAS		SMC_RxI_CALL(0x0169)
++#define SMC_RMI_VMI_SCAN_PROCS          SMC_RxI_CALL(0x016A)
+ #define SMC_RMI_RTT_UNMAP_UNPROTECTED	SMC_RxI_CALL(0x0162)
+ #define SMC_RMI_VERSION			SMC_RxI_CALL(0x0150)
+ 
+@@ -161,6 +162,7 @@ struct rec_params {
+ #define REC_ENTER_TRAP_WFI		BIT(2)
+ #define REC_ENTER_TRAP_WFE		BIT(3)
+ #define REC_ENTER_RIPAS_RESPONSE	BIT(4)
++#define REC_ENTER_FLAG_VMI_SCAN		BIT(63)
+ 
+ #define REC_RUN_GPRS			31
+ #define REC_GIC_NUM_LRS			16
+@@ -242,6 +244,8 @@ struct rec_exit {
+ 	union { /* 0x700 */
+ 		struct {
+ 			u8 pmu_ovf_status;
++			u8 _pad_pmu[7];
++			u8 vmi_encrypted[16];
+ 		};
+ 		u8 padding7[0x100];
+ 	};
+diff --git a/arch/arm64/kvm/arm.c b/arch/arm64/kvm/arm.c
+index 8c295c2db..fddca814d 100644
+--- a/arch/arm64/kvm/arm.c
++++ b/arch/arm64/kvm/arm.c
+@@ -6,6 +6,7 @@
+ 
+ #include <linux/bug.h>
+ #include <linux/cpu_pm.h>
++#include <linux/debugfs.h>
+ #include <linux/entry-kvm.h>
+ #include <linux/errno.h>
+ #include <linux/err.h>
+@@ -278,12 +279,57 @@ vm_fault_t kvm_arch_vcpu_fault(struct kvm_vcpu *vcpu, struct vm_fault *vmf)
+ 	return VM_FAULT_SIGBUS;
+ }
+ 
++/* VMI debugfs interface */
++static int vmi_scan_write(void *data, u64 val)
++{
++        struct kvm *kvm = data;
++        struct kvm_vcpu *vcpu;
++        unsigned long i;
++        int ret = -EINVAL;
++
++        kvm_for_each_vcpu(i, vcpu, kvm) {
++                if (vcpu->arch.rec.rec_page) {
++                        vcpu->arch.rec.vmi_scan_pending = true;
++			pr_info("VMI scan requested on vcpu %lu\n", i);
++                        return 0;
++                }
++        }
++        return ret;
++}
++
++static int vmi_cmd_write(void *data, u64 val)
++{
++        struct kvm *kvm = data;
++        struct kvm_vcpu *vcpu;
++        unsigned long i;
++
++        kvm_for_each_vcpu(i, vcpu, kvm) {
++                if (vcpu->arch.rec.rec_page) {
++                        vcpu->arch.rec.vmi_cmd_pending = true;
++                        vcpu->arch.rec.vmi_cmd_type = (u8)(val & 0xFF);
++                        vcpu->arch.rec.vmi_cmd_arg0 = val >> 8;
++                        pr_err("VMI CMD[%d] arg0=0x%llx queued on vcpu %lu\n",
++                               vcpu->arch.rec.vmi_cmd_type,
++                               vcpu->arch.rec.vmi_cmd_arg0, i);
++                        return 0;
++                }
++        }
++        return -EINVAL;
++}
++
++DEFINE_DEBUGFS_ATTRIBUTE(vmi_cmd_fops, NULL, vmi_cmd_write, "%llu\n");
++
++DEFINE_DEBUGFS_ATTRIBUTE(vmi_scan_fops, NULL, vmi_scan_write, "%llu\n");
++
+ void kvm_arch_create_vm_debugfs(struct kvm *kvm)
+ {
+ 	kvm_sys_regs_create_debugfs(kvm);
+ 	kvm_s2_ptdump_create_debugfs(kvm);
++	debugfs_create_file("vmi_scan", 0200, kvm->debugfs_dentry, kvm, &vmi_scan_fops);
++	debugfs_create_file("vmi_cmd", 0200, kvm->debugfs_dentry, kvm, &vmi_cmd_fops);
+ }
+ 
++
+ static void kvm_destroy_mpidr_data(struct kvm *kvm)
+ {
+ 	struct kvm_mpidr_data *data;
+@@ -489,10 +535,114 @@ int kvm_vm_ioctl_check_extension(struct kvm *kvm, long ext)
+ 	return r;
+ }
+ 
++/*
++ * VMI: find the (single) realm VM in the system and dispatch a VMI command
++ * synchronously via the rec_run.enter flag channel. Blocks until the result
++ * comes back from RMM (via handle_rec_exit waking us up) or timeout.
++ *
++ * Assumption: at most one realm VM exists at any time.
++ */
++static int kvm_cca_vmi_vm_ioctl(struct kvm_cca_vmi_cmd *cmd)
++{
++	struct kvm *kvm, *target_kvm = NULL;
++	struct kvm_vcpu *vcpu;
++	struct realm_rec *rec;
++	long timeout;
++	int ret = 0;
++
++	/* Find the realm VM. */
++	mutex_lock(&kvm_lock);
++	list_for_each_entry(kvm, &vm_list, vm_list) {
++		if (kvm_is_realm(kvm)) {
++			target_kvm = kvm;
++			kvm_get_kvm(target_kvm);
++			break;
++		}
++	}
++	mutex_unlock(&kvm_lock);
++
++	if (!target_kvm) {
++		cmd->status = -ENODEV;
++		return -ENODEV;
++	}
++
++	if (kvm_realm_state(target_kvm) != REALM_STATE_ACTIVE) {
++		ret = -ENOTCONN;
++		cmd->status = ret;
++		goto out_put;
++	}
++
++	vcpu = kvm_get_vcpu(target_kvm, 0);
++	if (!vcpu) {
++		ret = -ENOENT;
++		cmd->status = ret;
++		goto out_put;
++	}
++
++	rec = &vcpu->arch.rec;
++
++	/* Set up the pending command and arm the waiter. */
++	rec->vmi_cmd_done = false;
++	rec->vmi_cmd_type = cmd->cmd;
++	rec->vmi_cmd_arg0 = cmd->addr ? cmd->addr : cmd->reg_id;
++	rec->vmi_cmd_pending = true;
++
++	/* Kick the vcpu so it exits the realm and runs kvm_rec_enter soon. */
++	kvm_vcpu_kick(vcpu);
++
++	/* Block until handle_rec_exit signals completion, or 5 seconds elapse. */
++	timeout = wait_event_interruptible_timeout(rec->vmi_wait,
++						   rec->vmi_cmd_done,
++						   60 * HZ);
++	if (timeout == 0) {
++		/* Timed out. Tear down the pending state so it isn't applied later. */
++		rec->vmi_cmd_pending = false;
++		rec->vmi_cmd_waiting = false;
++		ret = -ETIMEDOUT;
++		cmd->status = ret;
++		goto out_put;
++	}
++	if (timeout < 0) {
++		/* Interrupted by signal. */
++		rec->vmi_cmd_pending = false;
++		rec->vmi_cmd_waiting = false;
++		ret = -EINTR;
++		cmd->status = ret;
++		goto out_put;
++	}
++
++	/* Success: copy the result. */
++	cmd->status = rec->vmi_result_status;
++	cmd->result_val = rec->vmi_result_val;
++	cmd->result_size = 8;
++	ret = 0;
++
++out_put:
++	kvm_put_kvm(target_kvm);
++	return ret;
++}
++
+ long kvm_arch_dev_ioctl(struct file *filp,
+ 			unsigned int ioctl, unsigned long arg)
+ {
+-	return -EINVAL;
++	void __user *argp = (void __user *)arg;
++
++	switch (ioctl) {
++	case KVM_ARM_CCA_VMI_VM: {
++		struct kvm_cca_vmi_cmd cmd;
++		int r;
++
++		if (copy_from_user(&cmd, argp, sizeof(cmd)))
++			return -EFAULT;
++		r = kvm_cca_vmi_vm_ioctl(&cmd);
++		/* Always copy back so userspace gets cmd.status even on error. */
++		if (copy_to_user(argp, &cmd, sizeof(cmd)))
++			return -EFAULT;
++		return r;
++	}
++	default:
++		return -EINVAL;
++	}
+ }
+ 
+ struct kvm *kvm_arch_alloc_vm(void)
+@@ -1306,7 +1456,7 @@ int kvm_arch_vcpu_ioctl_run(struct kvm_vcpu *vcpu)
+ 			ret = kvm_rec_enter(vcpu);
+ 		else
+ 			ret = kvm_arm_vcpu_enter_exit(vcpu);
+-
++		
+ 		vcpu->mode = OUTSIDE_GUEST_MODE;
+ 		vcpu->stat.exits++;
+ 		/*
+@@ -1917,6 +2067,21 @@ long kvm_arch_vcpu_ioctl(struct file *filp,
+ 			return -EFAULT;
+ 		return kvm_arm_vcpu_rmm_psci_complete(vcpu, &req);
+ 	}
++	case KVM_ARM_VMI_SCAN_PROCS: {
++                r = kvm_vmi_scan_procs(vcpu);
++                break;
++    	}
++	case KVM_ARM_CCA_VMI: {
++                struct kvm_cca_vmi_cmd cmd;
++                if (copy_from_user(&cmd, argp, sizeof(cmd)))
++                        return -EFAULT;
++                r = kvm_cca_vmi_dispatch(vcpu, &cmd);
++                if (r == 0) {
++                        if (copy_to_user(argp, &cmd, sizeof(cmd)))
++                                return -EFAULT;
++                }
++                break;
++        }
+ 	default:
+ 		r = -EINVAL;
+ 	}
+diff --git a/arch/arm64/kvm/rme-exit.c b/arch/arm64/kvm/rme-exit.c
+index 06ec0d786..80fa66ac3 100644
+--- a/arch/arm64/kvm/rme-exit.c
++++ b/arch/arm64/kvm/rme-exit.c
+@@ -182,6 +182,44 @@ int handle_rec_exit(struct kvm_vcpu *vcpu, int rec_run_ret)
+ 	vcpu->arch.fault.hpfar_el2 = rec->run->exit.hpfar;
+ 
+ 	update_arch_timer_irq_lines(vcpu);
++	
++	 /* DEBUG: only log when ioctl is waiting */
++        if (rec->vmi_cmd_waiting) {
++                pr_err("KVM rec exit: waiting=1 gprs[0]=0x%llx exit_reason=%u\n",
++                       (unsigned long long)rec->run->exit.gprs[0],
++                       rec->run->exit.exit_reason);
++        }
++		
++	/* VMI cmd: copy result from RMM and wake up ioctl waiter */
++        if (rec->vmi_cmd_waiting) {
++                rec->vmi_result_val = rec->run->exit.gprs[0];
++                rec->vmi_result_status = 0;
++                rec->vmi_cmd_done = true;
++                rec->vmi_cmd_waiting = false;
++                /* clear so the next exit doesn't see stale data */
++                rec->run->exit.gprs[0] = 0;
++                wake_up(&rec->vmi_wait);
++        }
++
++	/* Check for VMI scan results */
++        {
++                u8 *enc = rec->run->exit.vmi_encrypted;
++                bool has_result = false;
++                int i;
++                for (i = 0; i < 16; i++) {
++                        if (enc[i] != 0) { has_result = true; break; }
++                }
++                if (has_result) {
++                        pr_info("VMI encrypted result received: "
++                                "%02x%02x%02x%02x%02x%02x%02x%02x"
++                                "%02x%02x%02x%02x%02x%02x%02x%02x\n",
++                                enc[0],enc[1],enc[2],enc[3],
++                                enc[4],enc[5],enc[6],enc[7],
++                                enc[8],enc[9],enc[10],enc[11],
++                                enc[12],enc[13],enc[14],enc[15]);
++                        memset(enc, 0, 16);
++                }
++        }
+ 
+ 	/* Reset the emulation flags for the next run of the REC */
+ 	rec->run->enter.flags = 0;
+diff --git a/arch/arm64/kvm/rme.c b/arch/arm64/kvm/rme.c
+index d8e0a447e..5266ab90a 100644
+--- a/arch/arm64/kvm/rme.c
++++ b/arch/arm64/kvm/rme.c
+@@ -1434,10 +1434,72 @@ int kvm_rec_enter(struct kvm_vcpu *vcpu)
+ 	if (kvm_realm_state(vcpu->kvm) != REALM_STATE_ACTIVE)
+ 		return -EINVAL;
+ 
++	/* VMI: set scan flag if requested */
++        if (rec->vmi_scan_pending) {
++                rec->vmi_scan_pending = false;
++                rec->run->enter.flags |= REC_ENTER_FLAG_VMI_SCAN;
++                pr_info("VMI scan flag set in rec_run entry\n");
++        }
++
++	/* VMI CMD: pass command via rec_run entry flags + gprs */
++        if (rec->vmi_cmd_pending) {
++                rec->vmi_cmd_pending = false;
++                rec->vmi_cmd_waiting = true;
++		rec->run->enter.flags |= REC_ENTER_FLAG_VMI_SCAN;
++                rec->run->enter.gprs[0] = rec->vmi_cmd_type;
++                rec->run->enter.gprs[1] = rec->vmi_cmd_arg0;
++                pr_err("VMI CMD[%d] arg0=0x%llx set in rec_run entry\n",
++                       rec->vmi_cmd_type, rec->vmi_cmd_arg0);
++        }	
++
+ 	return rmi_rec_enter(virt_to_phys(rec->rec_page),
+ 			     virt_to_phys(rec->run));
+ }
+ 
++int kvm_vmi_scan_procs(struct kvm_vcpu *vcpu)
++{
++        struct realm_rec *rec = &vcpu->arch.rec;
++
++        if (kvm_realm_state(vcpu->kvm) != REALM_STATE_ACTIVE)
++                return -EINVAL;
++
++	return rmi_vmi_scan_procs(virt_to_phys(rec->rec_page),
++                                  virt_to_phys(rec->run));
++}
++
++int kvm_cca_vmi_dispatch(struct kvm_vcpu *vcpu, struct kvm_cca_vmi_cmd *cmd)
++{
++        struct realm_rec *rec = &vcpu->arch.rec;
++        int ret;
++        unsigned long out_val = 0;
++
++        if (kvm_realm_state(vcpu->kvm) != REALM_STATE_ACTIVE)
++                return -EINVAL;
++
++        /* For FULL_SCAN, use simple call */
++        if (cmd->cmd == CCA_VMI_CMD_FULL_SCAN) {
++                ret = rmi_vmi_scan_procs(virt_to_phys(rec->rec_page),
++                                         virt_to_phys(rec->run));
++                cmd->status = ret;
++                return ret ? -EIO : 0;
++        }
++
++        /* Fine-grained VMI command */
++        ret = rmi_vmi_scan_procs_ex(virt_to_phys(rec->rec_page),
++                                     virt_to_phys(rec->run),
++                                     cmd->cmd,
++                                     cmd->addr ? cmd->addr : cmd->reg_id,
++                                     &out_val);
++
++        cmd->status = ret;
++        if (ret)
++                return -EIO;
++
++        cmd->result_val = out_val;
++        cmd->result_size = 8;
++        return 0;
++}
++
+ static void free_rec_aux(struct page **aux_pages,
+ 			 unsigned int num_aux)
+ {
+@@ -1551,6 +1613,13 @@ int kvm_create_rec(struct kvm_vcpu *vcpu)
+ 
+ 	rec->mpidr = mpidr;
+ 
++	/* VMI ioctl synchronization */
++        init_waitqueue_head(&rec->vmi_wait);
++        rec->vmi_cmd_waiting = false;
++        rec->vmi_cmd_done = false;
++        rec->vmi_result_status = 0;
++        rec->vmi_result_val = 0;
++
+ 	free_page((unsigned long)params);
+ 	return 0;
+ 
+diff --git a/arch/arm64/mm/mmu.c b/arch/arm64/mm/mmu.c
+index e55b02fbd..9e4ffb147 100644
+--- a/arch/arm64/mm/mmu.c
++++ b/arch/arm64/mm/mmu.c
+@@ -724,7 +724,12 @@ static void __init declare_vma(struct vm_struct *vma,
+ #ifdef CONFIG_UNMAP_KERNEL_AT_EL0
+ static pgprot_t kernel_exec_prot(void)
+ {
++
++#if defined(CONFIG_STRICT_KERNEL_RWX)
+ 	return rodata_enabled ? PAGE_KERNEL_ROX : PAGE_KERNEL_EXEC;
++#else
++	return PAGE_KERNEL_EXEC;
++#endif
+ }
+ 
+ static int __init map_entry_trampoline(void)
+diff --git a/include/uapi/linux/kvm.h b/include/uapi/linux/kvm.h
+index 74f256eb0..494289cb7 100644
+--- a/include/uapi/linux/kvm.h
++++ b/include/uapi/linux/kvm.h
+@@ -1596,4 +1596,36 @@ struct kvm_arm_rmm_psci_complete {
+ /* FIXME: Update nr (0xd2) when merging */
+ #define KVM_ARM_VCPU_RMM_PSCI_COMPLETE	_IOW(KVMIO, 0xd2, struct kvm_arm_rmm_psci_complete)
+ 
++#define KVM_ARM_VMI_SCAN_PROCS          _IO(KVMIO, 0xd7)
++
++/* CCA VMI command types */
++#define CCA_VMI_CMD_FULL_SCAN     0
++#define CCA_VMI_CMD_READ_PA       1
++#define CCA_VMI_CMD_READ_VA       2
++#define CCA_VMI_CMD_GET_VCPUREG   3
++#define CCA_VMI_CMD_GET_VCPUREGS  4
++#define CCA_VMI_CMD_PAUSE_VM      5
++#define CCA_VMI_CMD_RESUME_VM     6
++#define CCA_VMI_CMD_SET_MEM_EVENT 7
++#define CCA_VMI_CMD_CLR_MEM_EVENT 8
++
++struct kvm_cca_vmi_cmd {
++	/* request */
++	__u8   cmd;
++	__u8   size;
++	__u16  vcpu;
++	__u32  reg_id;
++	__u64  addr;
++	__u64  pid;
++	__u64  access_flags;
++	__u64  reserved[2];
++	/* response (filled by kernel) */
++	__s32  status;
++	__u32  result_size;
++	__u64  result_val;
++	__u8   result_buf[4096];
++};
++
++#define KVM_ARM_CCA_VMI  _IOWR(KVMIO, 0xd8, struct kvm_cca_vmi_cmd)
++#define KVM_ARM_CCA_VMI_VM  _IOWR(KVMIO, 0xd9, struct kvm_cca_vmi_cmd)
+ #endif /* __LINUX_KVM_H */
